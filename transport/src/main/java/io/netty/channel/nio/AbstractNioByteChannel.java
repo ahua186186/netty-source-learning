@@ -138,6 +138,8 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
 
                     allocHandle.incMessagesRead(1);
                     readPending = false;
+                    //触发pipeline中的ChannelRead事件，对于clinet来说，read是一个In的事件
+                    //netty是 Head--->tail的路径
                     pipeline.fireChannelRead(byteBuf);
                     byteBuf = null;
                 } while (allocHandle.continueReading());

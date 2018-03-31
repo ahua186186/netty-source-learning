@@ -146,6 +146,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             throw new NullPointerException("selectStrategy");
         }
         provider = selectorProvider;
+        //打开一个Selector
         final SelectorTuple selectorTuple = openSelector();
         selector = selectorTuple.selector;
         unwrappedSelector = selectorTuple.unwrappedSelector;
@@ -174,7 +175,9 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         } catch (IOException e) {
             throw new ChannelException("failed to open a new selector", e);
         }
-
+        //接着DISABLE_KEYSET_OPTIMIZATION是判断是否需要对sun.nio.ch.SelectorImpl中的selectedKeys进行优化, 不做配置的话默认需要优化.
+        //做什么优化呢？看类SelectedSelectionKeySet，
+        //selectedKeys和publicSelectedKeys是个HashSet, 新的数据结构是双数组A和B, 初始大小1024, 避免了HashSet的频繁自动扩容,
         if (DISABLE_KEYSET_OPTIMIZATION) {
             return new SelectorTuple(unwrappedSelector);
         }
@@ -398,6 +401,20 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         logger.info("Migrated " + nChannels + " channel(s) to the new Selector.");
     }
 
+
+    /**
+     * 接下来看这个run方法的大致流程:
+     * <p>
+     * 1.先调用hasTask()判断是否有非IO任务, 如果有的话, 选择调用非阻塞的selectNow()让select立即返回, 否则以阻塞的方式调用select. 后续再分析select方法, 目前先把run的流程梳理完.
+     * <p>
+     * 2.两类任务执行的时间比例由ioRatio来控制, 你可以通过它来限制非IO任务的执行时间, 默认值是50, 表示允许非IO任务获得和IO任务相同的执行时间, 这个值根据自己的具体场景来设置.
+     * <p>
+     * 3.接着调用processSelectedKeys()处理IO事件, 后边会再详细分析.
+     * <p>
+     * 4.执行完IO任务后就轮到非IO任务了runAllTasks().
+     * <p>
+     * 5.最后scheduleExecution()是自己调度自己进入下一个轮回, 如此反复, 生命不息调度不止, 除非被shutDown了, isShuttingDown()方法就是去检查state是否被标记为ST_SHUTTING_DOWN.</pre>
+     */
     @Override
     protected void run() {
         for (;;) {
@@ -406,6 +423,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                     case SelectStrategy.CONTINUE:
                         continue;
                     case SelectStrategy.SELECT:
+                        //阻塞select方法
                         select(wakenUp.getAndSet(false));
 
                         // 'wakenUp.compareAndSet(false, true)' is always evaluated
@@ -494,6 +512,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     private void processSelectedKeys() {
         if (selectedKeys != null) {
+            //select过后, 有了一些就绪的读啊写啊等事件,
             processSelectedKeysOptimized();
         } else {
             processSelectedKeysPlain(selector.selectedKeys());
@@ -572,11 +591,16 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             final SelectionKey k = selectedKeys.keys[i];
             // null out entry in the array to allow to have it GC'ed once the Channel close
             // See https://github.com/netty/netty/issues/2363
+            //这么做是为了帮助GC, 这个key处理完了就应该被GC回收了, 如果array对这个key继续维持强引用, 在循环处理后续其他key的时候可能要消耗很长时间,
+            // 对GC, 还是能帮则帮吧, Doug lea在设计jsr166也就是jdk中juc包下面的代码也有用到过类似小优化.
             selectedKeys.keys[i] = null;
 
+            //这个object是AbstractNioChannel，这个就要在这到
+            //selectionKey = javaChannel().register(((NioEventLoop) eventLoop().unwrap()).selector, 0, this);说起了
             final Object a = k.attachment();
 
             if (a instanceof AbstractNioChannel) {
+                //拿到具体的channel进行读写之类
                 processSelectedKey(k, (AbstractNioChannel) a);
             } else {
                 @SuppressWarnings("unchecked")
@@ -595,6 +619,9 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    /**
+     * 终于见到熟悉的NIO处理代码了, 首先netty中每个channel都有一个unsafe,
+     */
     private void processSelectedKey(SelectionKey k, AbstractNioChannel ch) {
         final AbstractNioChannel.NioUnsafe unsafe = ch.unsafe();
         if (!k.isValid()) {
@@ -642,6 +669,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead
             // to a spin loop
             if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
+                //client实现NioByteUnsafe
+                //server实现NioMessageUnsafe
                 unsafe.read();
             }
         } catch (CancelledKeyException ignored) {
@@ -724,6 +753,13 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    /**
+     * 1)要了解delayNanos我们需要知道每个EventLoop都有一个延迟执行任务的队列(在父类SingleThreadEventExecutor中), 是的现在我们知道EventLoop有2个队列了.
+     2)delayNanos就是去这个延迟队列里面瞄一眼是否有非IO任务未执行, 如果没有则返回1秒钟
+     3)如果很不幸延迟队列里面有任务, delayNanos的计算结果就等于这个task的deadlineNanos到来之前的这段时间, 也即是说select在这个task按预约到期执行的时候就返回了, 不会耽误这个task.
+     4)如果最终计算出来的可以无忧无虑select的时间(selectDeadLineNanos - currentTimeNanos)小于500000L纳秒, 就认为这点时间是干不出啥大事业的, 还是selectNow一下直接返回吧, 以免耽误了延迟队列里预约好的task.
+     5)如果大于500000L纳秒, 表示很乐观, 就以1000000L纳秒为时间片, 放肆的去执行阻塞的select了, 阻塞时间就是timeoutMillis(n * 1000000L纳秒时间片).
+     */
     private void select(boolean oldWakenUp) throws IOException {
         Selector selector = this.selector;
         try {
@@ -787,6 +823,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                             "Selector.select() returned prematurely {} times in a row; rebuilding Selector {}.",
                             selectCnt, selector);
 
+
+                    //为什么要重建？ 因为nio有个臭名昭著的epoll cpu 100%的bug, 为了规避这个bug, 无奈重建。
                     rebuildSelector();
                     selector = this.selector;
 

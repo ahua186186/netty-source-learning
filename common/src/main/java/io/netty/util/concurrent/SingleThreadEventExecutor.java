@@ -162,6 +162,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         this.addTaskWakesUp = addTaskWakesUp;
         this.maxPendingTasks = Math.max(16, maxPendingTasks);
         this.executor = ObjectUtil.checkNotNull(executor, "executor");
+        //创建任务队列
         taskQueue = newTaskQueue(this.maxPendingTasks);
         rejectedExecutionHandler = ObjectUtil.checkNotNull(rejectedHandler, "rejectedHandler");
     }
@@ -755,6 +756,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         return isTerminated();
     }
 
+    //Eventloop的执行函数
     @Override
     public void execute(Runnable task) {
         if (task == null) {
@@ -763,8 +765,10 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
         boolean inEventLoop = inEventLoop();
         if (inEventLoop) {
+            //调用的是main线程，不执行这分支
             addTask(task);
         } else {
+            //启动线程
             startThread();
             addTask(task);
             if (isShutdown() && removeTask(task)) {
@@ -857,10 +861,13 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     private static final long SCHEDULE_PURGE_INTERVAL = TimeUnit.SECONDS.toNanos(1);
 
+
+    //
     private void startThread() {
         if (state == ST_NOT_STARTED) {
             if (STATE_UPDATER.compareAndSet(this, ST_NOT_STARTED, ST_STARTED)) {
                 try {
+                    //真正做事的
                     doStartThread();
                 } catch (Throwable cause) {
                     STATE_UPDATER.set(this, ST_NOT_STARTED);
@@ -872,6 +879,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     private void doStartThread() {
         assert thread == null;
+        //这个Runnable用来实现IO线程在线程池中死循环的自己调度自己
         executor.execute(new Runnable() {
             @Override
             public void run() {
@@ -883,6 +891,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                 boolean success = false;
                 updateLastExecutionTime();
                 try {
+                    //这个是关键，转战EventLoop.run()方法了，具体实现到NioEventLoop中
                     SingleThreadEventExecutor.this.run();
                     success = true;
                 } catch (Throwable t) {
